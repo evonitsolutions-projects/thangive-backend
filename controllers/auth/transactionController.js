@@ -4,6 +4,8 @@ import { CustomErrorHandler } from "../../service/index.js";
 import paginationQuery from '../../helper/paginationQuery.js';
 import commonFunction from '../../helper/commonFunction.js';
 import refundHelper from '../../helper/refundHelper.js';
+import ownership from '../../helper/ownership.js';
+import completionHook from '../../helper/completionHook.js';
 
 const transactionController = {
     async addUpdateOrder(req, res, next) {
@@ -48,7 +50,15 @@ const transactionController = {
 
                 added_qty: Joi.number().optional(),
                 added_price: Joi.number().optional(),
-                partner_price: Joi.number().optional()
+                partner_price: Joi.number().optional(),
+
+                /* P3a — Order-wise ownership (write-side only). Reads of these
+                 * columns are NOT changed in P3a; the fields are accepted,
+                 * resolved, and written on INSERT only. */
+                origin_type: Joi.string().valid('SELF', 'RM_DIRECT', 'PARTNER_RM_VERIFIED', 'PARTNER_ON_BEHALF', 'ADMIN').optional(),
+                origin_lead_type: Joi.string().valid('partner_stock_order').optional(),
+                origin_lead_id: Joi.number().integer().optional(),
+                owner_rm_id: Joi.number().integer().optional() // only for ADMIN origin; ignored otherwise
             });
 
             const dataObj = { ...req.body };
@@ -56,6 +66,28 @@ const transactionController = {
             /* ------------------ Validate ------------------ */
             const { error } = orderSchema.validate(dataObj);
             if (error) return next(error);
+
+            /* ------------------ Ownership resolution (INSERT only) ------------------
+             * For a new order, resolve owner_rm_id + origin_type + origin_lead_* here.
+             * On UPDATE path (dataObj.order_id present) owner fields are immutable and
+             * stripped, so a later PATCH does not accidentally overwrite them.
+             */
+            const isOwnershipInsert = !dataObj.order_id;
+            let resolvedOwnership = null;
+            if (isOwnershipInsert) {
+                const actor = await ownership.getActor(req.user?._id, next);
+                const clientUser = actor ? await ownership.getClientAssignTo(dataObj.user_id, next) : null;
+                const leadErr = ownership.validateLead(dataObj, CustomErrorHandler);
+                if (leadErr) return next(leadErr);
+                resolvedOwnership = await ownership.pickOwnerRm({ actor, body: dataObj, clientUser }, CustomErrorHandler);
+                if (resolvedOwnership?.error) return next(resolvedOwnership.error);
+            } else {
+                // UPDATE path: do not let callers rewrite ownership columns.
+                delete dataObj.owner_rm_id;
+                delete dataObj.origin_type;
+                delete dataObj.origin_lead_type;
+                delete dataObj.origin_lead_id;
+            }
             const buyPrice = Number(dataObj.added_price ?? dataObj.price_per_share);
             const posQuery = `
                 SELECT 
@@ -105,10 +137,24 @@ const transactionController = {
                     created_at: new Date(),
                     addedUserId: dataObj.addedUserId || null,
                     // addedPartnerID: dataObj.addedPartnerID || null,
-                    partner_price: dataObj.partner_price || null
+                    partner_price: dataObj.partner_price || null,
+                    /* P3a: synthetic BUY carries owner_rm_id only. No origin fields,
+                     * no addedPartnerID change. Rationale in plan §6.2.1. */
+                    owner_rm_id: resolvedOwnership?.owner_rm_id ?? null
                 };
 
-                await insertData(`INSERT INTO order_transactions SET ?`, buyBeforeSellObj, next);
+                const syntheticResult = await insertData(`INSERT INTO order_transactions SET ?`, buyBeforeSellObj, next);
+                if (syntheticResult?.insertId) {
+                    // P3b: covers B-04 paths #1/#2 (advisor-2 SELL synthetic BUY). Always
+                    // no-ops here (is_excluded), kept for completeness per the "call from
+                    // every path" requirement. Awaited (not fire-and-forget) so a failure
+                    // is visible; logged, not fatal — the order row itself already exists.
+                    try {
+                        await completionHook.onOrderFullyCompleted(syntheticResult.insertId, req.user?._id);
+                    } catch (hookErr) {
+                        console.error('[completionHook] synthetic BUY call failed:', hookErr.message);
+                    }
+                }
                 console.log(buyGroup)
                 lastGroup = buyGroup;
                 remainingQty += Number(dataObj.added_qty);
@@ -191,6 +237,17 @@ const transactionController = {
             } else {
                 // dataObj.order_custom_id = await commonFunction.generateOrderId("Ord_B_");
                 dataObj.user_quantity = dataObj.quantity;
+
+                /* P3a: ownership columns on the main INSERT.
+                 * `resolvedOwnership` is set when isOwnershipInsert is true.
+                 * - owner_rm_id may be NULL (SELF by an unassigned client, D-06).
+                 * - origin_type comes from body or the derived fallback.
+                 * - origin_lead_type / origin_lead_id are copied through (optional pair). */
+                dataObj.owner_rm_id = resolvedOwnership?.owner_rm_id ?? null;
+                dataObj.origin_type = resolvedOwnership?.origin_type ?? null;
+                dataObj.origin_lead_type = dataObj.origin_lead_type || null;
+                dataObj.origin_lead_id = dataObj.origin_lead_id || null;
+
                 query = `INSERT INTO order_transactions SET ?`;
                 dataObj.created_at = new Date();
             }
@@ -199,6 +256,15 @@ const transactionController = {
 
             if (result.insertId) {
                 dataObj.order_id = result.insertId;
+            }
+
+            // P3b: covers B-04 path #3 (advisor-2 BUY / mark-as-sold advisor-2 SELL
+            // inserted already COMPLETED) and any other case that happens to be
+            // created/edited already fully COMPLETED. No-ops otherwise.
+            try {
+                await completionHook.onOrderFullyCompleted(dataObj.order_id, req.user?._id);
+            } catch (hookErr) {
+                console.error('[completionHook] main insert/update call failed:', hookErr.message);
             }
 
             return res.json({
@@ -319,8 +385,23 @@ const transactionController = {
             if (error) return next(error);
             Object.assign(dataObj, value);
 
-            /* ------------------ USER ↔ EMPLOYEE ASSIGNMENT CHECK ------------------ */
-            const assignCheckQuery = ` SELECT user_id  FROM users WHERE user_id = '${dataObj.user_id}' AND assign_to = '${dataObj.employee_id}' AND is_deleted = 0 LIMIT 1 `;
+            /* ------------------ ORDER OWNER ↔ EMPLOYEE AUTHORIZATION CHECK ------------------ */
+            // P4: authorize by the ORDER's owner_rm_id (set at creation, immutable except
+            // via explicit admin action — see helper/completionHook.js / assignToRM), not
+            // just the client's current assign_to. Falls back to assign_to for legacy rows
+            // where owner_rm_id is still NULL (orders created before this rollout). This is
+            // what lets the RM who actually owns a partner-origin order approve it even when
+            // the client's current assign_to still points at a different RM.
+            const assignCheckQuery = `
+                SELECT ot.order_id
+                  FROM order_transactions ot
+                  JOIN users u ON u.user_id = ot.user_id
+                 WHERE ot.order_id = '${dataObj.order_id}'
+                   AND ot.user_id = '${dataObj.user_id}'
+                   AND u.is_deleted = 0
+                   AND COALESCE(ot.owner_rm_id, u.assign_to) = '${dataObj.employee_id}'
+                 LIMIT 1
+            `;
             if (dataObj.employee_type == "RM") {
                 const assignCheck = await getData(
                     assignCheckQuery,
@@ -328,9 +409,15 @@ const transactionController = {
                 );
 
                 if (!assignCheck || assignCheck.length === 0) {
+                    // Final pass: CustomErrorHandler.unAuthorise() is hard-coded to 401,
+                    // which makes the frontend clear localStorage and redirect to /login —
+                    // logging the blocked RM out instead of just refusing the action. Use a
+                    // plain 403 instead (CustomErrorHandler has no 403 static of its own;
+                    // see the same fix already applied to addUpdatePayment's ownership
+                    // guard, and the forbidden() helper in userController.js).
                     return next(
-                        CustomErrorHandler.unauthorized(
-                            "This user is not assigned to the given employee"
+                        new CustomErrorHandler(403,
+                            "This order is not owned by the given employee"
                         )
                     );
                 }
@@ -464,23 +551,19 @@ const transactionController = {
 
             await insertData(query, updatedObject, next);
 
-            // Get latest order status
-            const order = await getData(
-                `SELECT rm_status, am_status, st_status, addedPartnerID, user_id
-                    FROM order_transactions
-                    WHERE order_id = ${dataObj.order_id}
-                    LIMIT 1`,
-                next
-            );
-
-            if (
-                order.length &&
-                order[0].rm_status === "COMPLETED" &&
-                order[0].am_status === "COMPLETED" &&
-                order[0].st_status === "COMPLETED" &&
-                order[0].addedPartnerID != null
-            ) {
-                await insertData(`UPDATE users SET assign_partner = ? WHERE user_id = ?`, [order[0].addedPartnerID, order[0].user_id], next);
+            // P3b: covers B-04 paths #4/#5/#6 — RM markAsSold-approve, and whichever of
+            // RM/AM/ST stage progression above is the one that completes the order.
+            // REPLACES the old inline "fetch order, check all-COMPLETED, write
+            // assign_partner" block that used to live here (see completionHook.js
+            // header for the exact behavior difference: advisor-2 / mark-as-sold
+            // orders no longer get assign_partner written, by design — D-05).
+            // actorId uses employee_id (the body-supplied acting staff id), matching
+            // this handler's existing trust model (the RM-assignment check above
+            // already trusts employee_id the same way).
+            try {
+                await completionHook.onOrderFullyCompleted(dataObj.order_id, dataObj.employee_id);
+            } catch (hookErr) {
+                console.error('[completionHook] updateOrderStatus call failed:', hookErr.message);
             }
 
             return res.json({
@@ -855,8 +938,11 @@ const transactionController = {
                     ON latest.latest_id = sp.stock_price_id
                 LEFT JOIN users partner_user
                     ON partner_user.user_id = ot.addedPartnerID
-                LEFT JOIN users rm                
-                    ON rm.user_id = users.assign_to
+                LEFT JOIN users rm
+                    /* P4: prefer the order's owner_rm_id so the displayed "RM" name matches
+                     * who is actually authorized to act on this order; falls back to
+                     * assign_to for legacy owner-NULL rows. */
+                    ON rm.user_id = COALESCE(ot.owner_rm_id, users.assign_to)
                 LEFT JOIN (
                     SELECT pt1.order_id, pt1.payment_type,pt1.remaining_amount,pt1.payment_custom_id
                     FROM payment_transactions pt1
@@ -968,11 +1054,13 @@ const transactionController = {
             }
 
             if (value.employee_id && value.employee_type == "RM") {
-                cond += ` AND users.assign_to = ${value.employee_id}`;
+                // P4: owner-based. COALESCE keeps legacy owner-NULL rows visible via assign_to
+                // until the backfill; new rows are scoped by who actually owns them.
+                cond += ` AND COALESCE(ot.owner_rm_id, users.assign_to) = ${value.employee_id}`;
             }
 
             if (value.rm_id) {
-                cond += ` AND users.assign_to = ${value.rm_id}`;
+                cond += ` AND COALESCE(ot.owner_rm_id, users.assign_to) = ${value.rm_id}`;
             }
 
             if (value.employee_id && value.employee_type == "PARTNER") {
@@ -996,7 +1084,8 @@ const transactionController = {
             if (value.verify) {
                 const listActor = await refundHelper.getActor(req.user?._id, next);
                 if (listActor && listActor.user_type === 'RM') {
-                    cond += ` AND users.assign_to = ${Number(listActor.user_id)} AND ot.addedPartnerID IS NOT NULL`;
+                    // P4: owner-based.
+                    cond += ` AND COALESCE(ot.owner_rm_id, users.assign_to) = ${Number(listActor.user_id)} AND ot.addedPartnerID IS NOT NULL`;
                 }
             }
 
@@ -1283,16 +1372,17 @@ const transactionController = {
                     IF(rm.middle_name IS NOT NULL AND rm.middle_name != '', ' ', ''),
                     rm.last_name
                 ) AS rmName,
-                usr.assign_to AS rm_id
+                /* P4: owner-based. Falls back to assign_to for legacy owner-NULL rows. */
+                COALESCE(ot.owner_rm_id, usr.assign_to) AS rm_id
             FROM order_transactions ot
-            JOIN stock_details sd 
+            JOIN stock_details sd
                 ON sd.stock_details_id = ot.stock_details_id
-            JOIN broker b 
+            JOIN broker b
                 ON b.broker_id = ot.broker_id
-            JOIN users usr 
+            JOIN users usr
                 ON usr.user_id = ot.user_id
-            LEFT JOIN users rm                
-            ON rm.user_id = usr.assign_to
+            LEFT JOIN users rm
+            ON rm.user_id = COALESCE(ot.owner_rm_id, usr.assign_to)
             JOIN stock_price sp
                 ON sp.stock_details_id = ot.stock_details_id
             JOIN (
@@ -1679,6 +1769,42 @@ const transactionController = {
             /* ------------------ VALIDATE INPUT ------------------ */
             const { error } = paymentSchema.validate(dataObj);
             if (error) return next(error);
+
+            /* ------------------ RM OWNERSHIP GUARD (P5) ------------------ */
+            // Mirrors the COALESCE(ot.owner_rm_id, <client>.assign_to) pattern already used
+            // by every other RM ownership gate in this file (e.g. updateOrderStatus above,
+            // getStockOrderList, getOrderDetails). The acting RM's own id comes from the JWT
+            // (req.user._id), never from the request body: this endpoint's Joi schema has
+            // never accepted an employee_id field, and the NOT_RECEIVED guard just below
+            // already resolves the actor the same JWT-sourced way for the same reason.
+            // AM is intentionally left untouched — no ownership restriction existed for AM
+            // anywhere else either, and this fix does not add one. A missing/invalid order
+            // is left to the existing "Invalid order" check further down.
+            if (dataObj.employee_type === 'RM') {
+                const ownerRows = await getData(
+                    `SELECT COALESCE(ot.owner_rm_id, client.assign_to) AS resolved_owner
+                       FROM order_transactions ot
+                       LEFT JOIN users client ON client.user_id = ot.user_id
+                      WHERE ot.order_id = ${Number(dataObj.order_id)}
+                      LIMIT 1`,
+                    next
+                );
+                if (ownerRows && ownerRows.length) {
+                    const resolvedOwner = ownerRows[0].resolved_owner;
+                    const actorId = Number(req.user?._id);
+                    if (resolvedOwner === null || Number(resolvedOwner) !== actorId) {
+                        // 403, not CustomErrorHandler.unAuthorise() (401) — a 401 makes the
+                        // frontend clear localStorage and redirect to /login, logging the
+                        // blocked RM out. The established P4 convention for an ownership
+                        // refusal that should not do that is a plain 403 (BACKEND-NOTES §17:
+                        // refund guards, dashboards, etc. all use this, since
+                        // CustomErrorHandler has no 403 static of its own).
+                        return next(new CustomErrorHandler(403,
+                            "This order is not owned by the given employee"
+                        ));
+                    }
+                }
+            }
 
             /* ------------------ REFUND GUARD ------------------ */
             const refundRows = await getData(
@@ -2339,7 +2465,8 @@ const transactionController = {
             LEFT JOIN users u
                 ON u.user_id = ot.user_id
             LEFT JOIN users rm_user
-                ON rm_user.user_id = u.assign_to
+                /* P4: owner-based display, falls back to assign_to for legacy rows. */
+                ON rm_user.user_id = COALESCE(ot.owner_rm_id, u.assign_to)
             LEFT JOIN users partner_user
                 ON partner_user.user_id = ot.addedPartnerID
             LEFT JOIN user_bank_details b
@@ -2390,7 +2517,8 @@ const transactionController = {
             }
 
             if (value.employee_id && value.employee_type === "RM") {
-                cond += ` AND u.assign_to = ${value.employee_id}`;
+                // P4: owner-based.
+                cond += ` AND COALESCE(ot.owner_rm_id, u.assign_to) = ${value.employee_id}`;
             }
 
             if (value.am_status) {

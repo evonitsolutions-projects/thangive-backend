@@ -4,6 +4,12 @@ import { CustomErrorHandler, JwtService } from "../../service/index.js";
 import md5 from 'md5';
 import paginationQuery from '../../helper/paginationQuery.js';
 import commonFunction from '../../helper/commonFunction.js';
+import ownership from '../../helper/ownership.js';
+import withTransaction from '../../helper/withTransaction.js';
+
+// P3b: matches the same local-helper pattern already used in refundController.js
+// (CustomErrorHandler has no 403 static of its own).
+const forbidden = (message) => new CustomErrorHandler(403, message);
 
 const userController = {
     // async addUpdateUserProfile(req, res, next) {
@@ -627,6 +633,21 @@ const userController = {
             // ------------------ Validate ------------------
             const { error } = schema.validate(dataObj ?? {});
             if (error) return next(error);
+
+            /* P3a: for RM callers, assign_to and created_id MUST come from the JWT, not the body.
+             * ADMIN / SM callers may continue to send explicit values (left as-is).
+             * Any other role reaching this endpoint is unexpected — rejected. */
+            const rmActor = await ownership.getActor(req.user?._id, next);
+            if (!rmActor) {
+                return next(CustomErrorHandler.unAuthorise ? CustomErrorHandler.unAuthorise('Unknown actor') : CustomErrorHandler.notFound('Unknown actor'));
+            }
+            if (rmActor.user_type === 'RM') {
+                dataObj.assign_to = Number(rmActor.user_id);
+                dataObj.created_id = Number(rmActor.user_id);
+            } else if (rmActor.user_type !== 'ADMIN' && rmActor.user_type !== 'SM') {
+                return next(CustomErrorHandler.badRequest(`rmCreateUpdateUser: role '${rmActor.user_type}' is not allowed to call this endpoint`));
+            }
+            // ADMIN / SM: body-supplied assign_to and created_id stand.
 
             const isUpdate = !!dataObj.user_id;  // 👈 true if user_id present
             const condition = isUpdate ? ` AND user_id != '${dataObj.user_id}'` : "";
@@ -1689,55 +1710,117 @@ const userController = {
         });
 
         const dataObj = req.body ?? {};
-        const { error } = userSchema.validate(dataObj);
+        const { error, value } = userSchema.validate(dataObj);
         if (error) {
             return next(error);
         }
 
         try {
-            // ---------- Check user exists ----------
-            const checkUserQuery = `
-                SELECT user_id 
-                FROM users 
-                WHERE user_id = ${dataObj.user_id}
-            `;
-
-            const userExists = await getData(checkUserQuery, next);
-            if (!userExists || userExists.length === 0) {
-                return next(
-                    CustomErrorHandler.doesNotExist("User not found")
-                );
+            /* P3b: ADMIN/SM only. Verified callers before restricting: every
+             * frontend call site is inside pages/Dashboard/SiteManager/
+             * (Users.jsx, Partners.jsx, PartnerList.jsx), which
+             * RoleProtectedRoute already gates to ["ADMIN","SM"] — this
+             * backend check cannot break a legitimate existing caller. */
+            const actor = await ownership.getActor(req.user?._id, next);
+            if (!actor) return next(CustomErrorHandler.doesNotExist('Unknown actor'));
+            if (actor.user_type !== 'ADMIN' && actor.user_type !== 'SM') {
+                return next(forbidden('assignToRM: ADMIN or SM role required'));
             }
 
             // ---------- Check RM exists ----------
-            const checkRMQuery = `
-                SELECT user_id 
-                FROM users 
-                WHERE user_id = ${dataObj.assign_to}
-            `;
-
-            const rmExists = await getData(checkRMQuery, next);
+            const rmExists = await getData(
+                `SELECT user_id FROM users WHERE user_id = ${Number(value.assign_to)}`,
+                next
+            );
             if (!rmExists || rmExists.length === 0) {
-                return next(
-                    CustomErrorHandler.doesNotExist("RM not found")
-                );
+                return next(CustomErrorHandler.doesNotExist("RM not found"));
             }
 
-            // ---------- Update assignment ----------
-            const updateQuery = `
-                UPDATE users 
-                SET assign_to = ${dataObj.assign_to}
-                WHERE user_id = ${dataObj.user_id}
-            `;
+            const newRm = Number(value.assign_to);
+            const targetUserId = Number(value.user_id);
 
-            await insertData(updateQuery, dataObj, next);
+            const result = await withTransaction(async (tx) => {
+                const targetRows = await tx.getData(
+                    `SELECT user_id, user_type, assign_to
+                       FROM users
+                      WHERE user_id = ${targetUserId}
+                      FOR UPDATE`
+                );
+                if (!targetRows || !targetRows.length) {
+                    return { notFound: true };
+                }
+                const target = targetRows[0];
+                const prevRm = target.assign_to;
+                const isPartner = target.user_type === 'PARTNER';
+
+                if (prevRm == null || Number(prevRm) !== newRm) {
+                    await tx.insertData(`UPDATE users SET assign_to = ? WHERE user_id = ?`, [newRm, targetUserId]);
+
+                    if (isPartner) {
+                        // Partner rows also get the dedicated partner_rm_id column (D-08e).
+                        await tx.insertData(`UPDATE users SET partner_rm_id = ? WHERE user_id = ?`, [newRm, targetUserId]);
+                        await tx.insertData(
+                            `INSERT INTO partner_rm_assignment_history
+                                (partner_user_id, previous_rm_id, new_rm_id, changed_by, reason)
+                             VALUES (?, ?, ?, ?, 'ADMIN_MANUAL')`,
+                            [targetUserId, prevRm, newRm, actor.user_id]
+                        );
+                    } else {
+                        await tx.insertData(
+                            `INSERT INTO user_rm_assignment_history
+                                (user_id, previous_rm_id, new_rm_id, changed_by, reason, order_id)
+                             VALUES (?, ?, ?, ?, 'ADMIN_MANUAL', NULL)`,
+                            [targetUserId, prevRm, newRm, actor.user_id]
+                        );
+                    }
+                }
+
+                // D-06 NULL-owner promotion — only meaningful for client (user_type='user')
+                // self-placed orders; partners do not place orders as order_transactions.user_id.
+                let promoted = 0;
+                if (!isPartner) {
+                    const orphanRows = await tx.getData(
+                        `SELECT order_id
+                           FROM order_transactions
+                          WHERE user_id = ${targetUserId}
+                            AND owner_rm_id IS NULL
+                            AND rm_status NOT IN ('REJECTED','CANCEL')
+                            AND am_status NOT IN ('REJECTED','CANCEL')
+                            AND st_status NOT IN ('REJECTED','CANCEL')
+                            AND cancellation_status <> 'COMPLETED'
+                            AND revenue_rm_id IS NULL
+                          FOR UPDATE`
+                    );
+                    for (const row of orphanRows || []) {
+                        await tx.insertData(
+                            `UPDATE order_transactions SET owner_rm_id = ? WHERE order_id = ? AND owner_rm_id IS NULL`,
+                            [newRm, row.order_id]
+                        );
+                        await tx.insertData(
+                            `INSERT INTO order_owner_history
+                                (order_id, previous_owner_rm_id, new_owner_rm_id, reason, changed_by)
+                             VALUES (?, NULL, ?, 'ADMIN_ASSIGN', ?)`,
+                            [row.order_id, newRm, actor.user_id]
+                        );
+                        promoted += 1;
+                    }
+                }
+
+                return { notFound: false, isPartner, promoted };
+            });
+
+            if (result.notFound) {
+                return next(CustomErrorHandler.doesNotExist("User not found"));
+            }
 
             return res.json({
                 success: true,
-                message: "RM assigned to user successfully",
+                message: "RM assigned successfully",
                 data: {
-                    user_id: dataObj.user_id,
-                    assign_to: dataObj.assign_to
+                    user_id: targetUserId,
+                    assign_to: newRm,
+                    is_partner: result.isPartner,
+                    orphan_orders_promoted: result.promoted,
                 }
             });
 

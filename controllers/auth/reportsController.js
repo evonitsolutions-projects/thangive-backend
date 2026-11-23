@@ -61,7 +61,9 @@ const rangeCond = (expr, start, end) =>
     (start ? ` AND ${expr} >= ${sqlStr(start)}` : '') + (end ? ` AND ${expr} < ${sqlStr(end)}` : '');
 
 /* ---------------- shared SQL pieces ---------------- */
-const OWNER_RM = `COALESCE(NULLIF(u.assign_to, 0), NULLIF(p.assign_to, 0))`;
+/* P4: owner-based. ot.owner_rm_id takes priority; the old assign_to fallback
+ * keeps legacy owner-NULL rows visible until the backfill runs. */
+const OWNER_RM = `COALESCE(NULLIF(ot.owner_rm_id, 0), NULLIF(u.assign_to, 0), NULLIF(p.assign_to, 0))`;
 const CLOSED = `(ot.rm_status IN ('REJECTED', 'CANCEL') OR ot.am_status IN ('REJECTED', 'CANCEL')
     OR ot.st_status IN ('REJECTED', 'CANCEL') OR ot.cancellation_status = 'COMPLETED')`;
 const ALL_DONE = `(ot.rm_status = 'COMPLETED' AND ot.am_status = 'COMPLETED' AND ot.st_status = 'COMPLETED')`;
@@ -393,7 +395,7 @@ DEFS.partners = {
     ],
     joi: { franchise_status: en('Pending', 'Verified', 'Rejected'), access: en('unlocked', 'locked'), rm_id: idNum() },
     from: `FROM users pu
-    LEFT JOIN users rm ON rm.user_id = pu.assign_to
+    LEFT JOIN users rm ON rm.user_id = COALESCE(pu.partner_rm_id, pu.assign_to)
     LEFT JOIN (SELECT user_id, MIN(partner_financial_id) AS mid FROM partner_financial_details WHERE is_deleted = 0 GROUP BY user_id) pm ON pm.user_id = pu.user_id
     LEFT JOIN partner_financial_details pfd ON pfd.partner_financial_id = pm.mid`,
     select: `pu.user_custum_id AS user_custum_id, ${NAME('pu')} AS partner_name, pu.phone_number AS phone_number, pu.email AS email,
@@ -403,13 +405,13 @@ DEFS.partners = {
         ${P_PROSPECTS} AS prospects, ${P_ORDERS} AS partner_orders, ${P_DEALS} AS deals, ${P_BUSINESS} AS business_value`,
     dateExpr: IST('pu.created_at'),
     baseWhere: `pu.user_type = 'PARTNER' AND pu.is_deleted = 0 AND pu.is_verified = 1`,
-    scope: (actor) => (actor.user_type === 'RM' ? `pu.assign_to = ${Number(actor.user_id)}` : null),
+    scope: (actor) => (actor.user_type === 'RM' ? `COALESCE(pu.partner_rm_id, pu.assign_to) = ${Number(actor.user_id)}` : null),
     search: [NAME('pu'), 'pu.user_custum_id', 'pu.phone_number', 'pu.email'],
     filters: (f, actor) => [
         f.franchise_status && `pfd.franchise_status = ${sqlStr(f.franchise_status)}`,
         f.access === 'unlocked' && PARTNER_DONE,
         f.access === 'locked' && `NOT IFNULL(${PARTNER_DONE}, 0)`,
-        f.rm_id && actor.user_type !== 'RM' && `pu.assign_to = ${Number(f.rm_id)}`,
+        f.rm_id && actor.user_type !== 'RM' && `COALESCE(pu.partner_rm_id, pu.assign_to) = ${Number(f.rm_id)}`,
     ],
     orderBy: 'pu.user_id DESC',
     summary: [
@@ -498,7 +500,7 @@ DEFS.prospects = {
     },
     from: `FROM partner_prospects pr
     JOIN users pu ON pu.user_id = pr.user_id
-    LEFT JOIN users rm ON rm.user_id = pu.assign_to`,
+    LEFT JOIN users rm ON rm.user_id = COALESCE(pu.partner_rm_id, pu.assign_to)`,
     select: `pr.partner_prospect_id AS partner_prospect_id,
         DATE_FORMAT(COALESCE(pr.lead_creation_date, DATE(pr.created_at)), '%Y-%m-%d') AS lead_date, ${NAME('pu')} AS partner_name,
         pr.client_firm_name AS client_name, pr.client_type AS client_type, pr.phone AS phone, pr.email AS email,
@@ -506,13 +508,13 @@ DEFS.prospects = {
         ${PR_STOCKS} AS stocks_count, ${PR_STOCK_NAMES} AS stock_names, ${PR_ORDERS} AS orders_count, ${NAME('rm')} AS rm_name`,
     dateExpr: `TIMESTAMP(COALESCE(pr.lead_creation_date, DATE(pr.created_at)))`,
     baseWhere: `pr.is_deleted = 0`,
-    scope: (actor) => (actor.user_type === 'RM' ? `pu.assign_to = ${Number(actor.user_id)}` : null),
+    scope: (actor) => (actor.user_type === 'RM' ? `COALESCE(pu.partner_rm_id, pu.assign_to) = ${Number(actor.user_id)}` : null),
     search: ['pr.client_firm_name', 'pr.phone', 'pr.email', NAME('pu')],
     filters: (f, actor) => [
         f.lead_type && `pr.lead_type = ${sqlStr(f.lead_type)}`,
         f.lead_status && `pr.lead_status = ${sqlStr(f.lead_status)}`,
         f.partner_id && `pr.user_id = ${Number(f.partner_id)}`,
-        f.rm_id && actor.user_type !== 'RM' && `pu.assign_to = ${Number(f.rm_id)}`,
+        f.rm_id && actor.user_type !== 'RM' && `COALESCE(pu.partner_rm_id, pu.assign_to) = ${Number(f.rm_id)}`,
     ],
     orderBy: 'pr.partner_prospect_id DESC',
     summary: [
@@ -1058,7 +1060,7 @@ const reportsController = {
             const partners = await getData(
                 `SELECT pu.user_id AS id, ${NAME('pu')} AS name FROM users pu
                  WHERE pu.user_type = 'PARTNER' AND pu.is_deleted = 0 AND pu.is_verified = 1
-                   ${actor.user_type === 'RM' ? `AND pu.assign_to = ${Number(actor.user_id)}` : ''}
+                   ${actor.user_type === 'RM' ? `AND COALESCE(pu.partner_rm_id, pu.assign_to) = ${Number(actor.user_id)}` : ''}
                  ORDER BY name`,
                 next
             );

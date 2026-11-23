@@ -75,7 +75,8 @@ const refundHelper = {
         const orders = await getData(
             `SELECT ot.order_id, ot.user_id, ot.transaction_type, ot.rm_status, ot.am_status, ot.st_status,
                     ot.refund_status, ot.cancellation_status, ot.quantity, ot.price_per_share,
-                    (ot.price_per_share * ot.quantity) AS deal_value, u.assign_to
+                    (ot.price_per_share * ot.quantity) AS deal_value, u.assign_to,
+                    ot.owner_rm_id
              FROM order_transactions ot
              JOIN users u ON u.user_id = ot.user_id
              WHERE ot.order_id = ${id} LIMIT 1`,

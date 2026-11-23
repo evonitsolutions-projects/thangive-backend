@@ -46,9 +46,13 @@ const refundController = {
             const ctx = await refundHelper.getContext(value.order_id, next);
             if (!ctx) return next(CustomErrorHandler.notFound('Order not found'));
 
-            // RM can act only on clients assigned to this RM
-            if (Number(ctx.order.assign_to) !== Number(actor.user_id)) {
-                return next(forbidden('This order does not belong to a client assigned to you'));
+            // P4: RM can act only on orders they OWN (owner_rm_id), falling back to the
+            // client's current assign_to for legacy owner-NULL rows. Previously this checked
+            // only assign_to, which would incorrectly block the RM who actually brought this
+            // order (via a partner lead) from raising a refund on it.
+            const effectiveOwner = ctx.order.owner_rm_id != null ? ctx.order.owner_rm_id : ctx.order.assign_to;
+            if (Number(effectiveOwner) !== Number(actor.user_id)) {
+                return next(forbidden('This order is not owned by you'));
             }
 
             const eligibility = refundHelper.checkEligibility(ctx);
@@ -349,7 +353,8 @@ const refundController = {
             let cond = '';
             let page = { pageQuery: '' };
 
-            if (actor.user_type === 'RM') cond += ` AND c.assign_to = ${Number(actor.user_id)}`;
+            // P4: owner-based. Falls back to assign_to for legacy owner-NULL rows.
+            if (actor.user_type === 'RM') cond += ` AND COALESCE(ot.owner_rm_id, c.assign_to) = ${Number(actor.user_id)}`;
 
             if (value.status === 'Active') cond += ` AND rr.status IN ('Pending','Accepted')`;
             else if (value.status) cond += ` AND rr.status = '${value.status}'`;

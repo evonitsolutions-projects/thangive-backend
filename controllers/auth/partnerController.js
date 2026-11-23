@@ -17,7 +17,9 @@ const PROSPECT_PASSWORD_FIELDS = [
 
 /**
  * Role comes from users.user_type of the token user (never from the request).
- * Allowed: the PARTNER who owns the prospect, the RM the partner is assigned to (users.assign_to), ADMIN.
+ * Allowed: the PARTNER who owns the prospect, the RM the partner is assigned to
+ * (P4: users.partner_rm_id, falling back to users.assign_to for legacy rows not
+ * yet backfilled), ADMIN.
  */
 async function canAccessProspectPasswords(actor, ownerId, next) {
     if (!actor) return false;
@@ -25,10 +27,10 @@ async function canAccessProspectPasswords(actor, ownerId, next) {
     if (actor.user_type === 'PARTNER') return Number(actor.user_id) === Number(ownerId);
     if (actor.user_type === 'RM') {
         const rows = await getData(
-            `SELECT assign_to FROM users WHERE user_id = ${Number(ownerId) || 0} AND user_type = 'PARTNER' LIMIT 1`,
+            `SELECT COALESCE(partner_rm_id, assign_to) AS effective_rm FROM users WHERE user_id = ${Number(ownerId) || 0} AND user_type = 'PARTNER' LIMIT 1`,
             next
         );
-        return !!(rows && rows.length && Number(rows[0].assign_to) === Number(actor.user_id));
+        return !!(rows && rows.length && Number(rows[0].effective_rm) === Number(actor.user_id));
     }
     return false;
 }
@@ -128,7 +130,9 @@ const partnerController = {
             }
 
             if (req.query.assign_to) {
-                cond += ` AND u.assign_to = ${req.query.assign_to}`;
+                // P4: prefer the dedicated partner_rm_id column; falls back to the
+                // double-duty assign_to for any legacy partner row not yet backfilled.
+                cond += ` AND COALESCE(u.partner_rm_id, u.assign_to) = ${req.query.assign_to}`;
             }
 
             if (req.query.username) {
@@ -3395,6 +3399,15 @@ const partnerController = {
             if (error) {
                 return next(error);
             }
+
+            /* Ownership note: whether this lead was created by the partner
+             * themselves or by an RM on their behalf is NOT a separate field —
+             * it is already derivable from created_by vs user_id (see the
+             * comment at RMOrderCreation.jsx:handleSave). created_by is set
+             * once at INSERT (defaulted to user_id when the partner creates
+             * their own lead) and is deleted on every UPDATE below, so it
+             * stays a stable signal without any new column. */
+
             let query = "";
             if (dataObj.partener_order_id) {
                 delete dataObj.created_by;
@@ -3588,8 +3601,12 @@ const partnerController = {
             }
 
             if (req.query.rm_id) {
+                // P4: Partner-menu reads prefer the snapshot taken at order creation
+                // (pso.owner_rm_id), then the partner's dedicated partner_rm_id, then the
+                // legacy assign_to — so a partner reassignment never moves historical
+                // partner orders off the RM who actually brought/owns them.
                 cond += `
-                    AND u.assign_to = ${req.query.rm_id}
+                    AND COALESCE(pso.owner_rm_id, u.partner_rm_id, u.assign_to) = ${req.query.rm_id}
                 `;
             }
 
@@ -3782,14 +3799,15 @@ const partnerController = {
                 } else if (readActor.user_type === 'PARTNER') {
                     readAllowed = Number(readActor.user_id) === Number(req.query.user_id);
                 } else if (readActor.user_type === 'RM') {
+                    // P4: owner-based. Falls back to assign_to for legacy owner-NULL rows.
                     const ownRows = await getData(
-                        `SELECT u.assign_to
+                        `SELECT COALESCE(ot.owner_rm_id, u.assign_to) AS effective_owner
                          FROM order_transactions ot
                          JOIN users u ON u.user_id = ot.user_id
                          WHERE ot.order_id = ${Number(req.query.order_id)} LIMIT 1`,
                         next
                     );
-                    readAllowed = !!(ownRows && ownRows.length && Number(ownRows[0].assign_to) === Number(readActor.user_id));
+                    readAllowed = !!(ownRows && ownRows.length && Number(ownRows[0].effective_owner) === Number(readActor.user_id));
                 }
             }
             if (!readAllowed) {

@@ -28,7 +28,11 @@ const FROM_ORDERS = `
     JOIN users u ON u.user_id = ot.user_id
     LEFT JOIN users p ON p.user_id = ot.addedPartnerID
     LEFT JOIN advisor ad ON ad.advisor_id = ot.advisor_id`;
-const OWNER_RM = `COALESCE(NULLIF(u.assign_to, 0), NULLIF(p.assign_to, 0))`;
+/* P4: owner-based. ot.owner_rm_id (set at order creation, immutable except via
+ * explicit admin action — see assignToRM / completionHook.js) takes priority.
+ * The old client/partner assign_to fallback keeps legacy owner-NULL rows
+ * (created before this rollout) visible until the backfill runs. */
+const OWNER_RM = `COALESCE(NULLIF(ot.owner_rm_id, 0), NULLIF(u.assign_to, 0), NULLIF(p.assign_to, 0))`;
 const ELIGIBLE = `ot.rm_status NOT IN ('REJECTED', 'CANCEL')
     AND ot.am_status NOT IN ('REJECTED', 'CANCEL')
     AND ot.st_status NOT IN ('REJECTED', 'CANCEL')
