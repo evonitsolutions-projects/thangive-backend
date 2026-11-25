@@ -96,9 +96,24 @@ export async function onOrderFullyCompleted(orderId, actorId) {
             );
         }
 
-        // --- partner-origin assign_to flip (D-03/D-04) ---
+        // --- partner-origin and RM_DIRECT assign_to flip (D-03/D-04, extended
+        //     for the Create Direct Order feature, P-CDO §5/§6) ---
+        //
+        // RM_DIRECT: an RM creates an order directly for ANY existing user
+        // (not necessarily their own roster client). Until the order is
+        // fully completed the client stays with whichever RM they were
+        // already assigned to; only on completion does ownership (which was
+        // fixed at creation, in owner_rm_id) flip the client's assign_to.
+        // Reuses the exact same transaction, the same admin-override guard
+        // and the same "no-op when already correct" guard as the existing
+        // partner flip below -- it is a sibling condition, not a rewrite.
+        // SELF orders are deliberately excluded (origin_type never matches
+        // either branch), and advisor-2 BUY / mark-as-sold SELL never reach
+        // this code at all (the isExcluded early-return above already
+        // stops them), so neither can ever trigger a reassignment here.
         const isPartnerOrigin = o.origin_type === 'PARTNER_RM_VERIFIED' || o.origin_type === 'PARTNER_ON_BEHALF';
-        if (isPartnerOrigin && o.owner_rm_id != null) {
+        const isRmDirectOrigin = o.origin_type === 'RM_DIRECT';
+        if ((isPartnerOrigin || isRmDirectOrigin) && o.owner_rm_id != null) {
             const adminOverride = await tx.getData(
                 `SELECT 1 AS hit FROM user_rm_assignment_history
                   WHERE user_id = ${Number(o.user_id)}
@@ -112,12 +127,13 @@ export async function onOrderFullyCompleted(orderId, actorId) {
                 );
                 const prevRm = userRows && userRows.length ? userRows[0].assign_to : null;
                 if (prevRm == null || Number(prevRm) !== Number(o.owner_rm_id)) {
+                    const flipReason = isPartnerOrigin ? 'ORDER_COMPLETION_PARTNER_FLIP' : 'ORDER_COMPLETION_RM_DIRECT_FLIP';
                     await tx.insertData(`UPDATE users SET assign_to = ? WHERE user_id = ?`, [o.owner_rm_id, o.user_id]);
                     await tx.insertData(
                         `INSERT INTO user_rm_assignment_history
                             (user_id, previous_rm_id, new_rm_id, changed_by, reason, order_id)
-                         VALUES (?, ?, ?, ?, 'ORDER_COMPLETION_PARTNER_FLIP', ?)`,
-                        [o.user_id, prevRm, o.owner_rm_id, actor, id]
+                         VALUES (?, ?, ?, ?, ?, ?)`,
+                        [o.user_id, prevRm, o.owner_rm_id, actor, flipReason, id]
                     );
                 }
             }
