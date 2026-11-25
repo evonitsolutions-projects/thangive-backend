@@ -1274,6 +1274,27 @@ const userController = {
 
     async getUserList(req, res, next) {
         try {
+            /* ------------------ Access control (Create Direct Order, P-CDO) ------------------
+               GET /userList serves two different callers: a profile self-fetch
+               (?user_id=<own id>, used by every role to load their own profile)
+               and a staff search/list capability (phone_number/username/email,
+               or a user_id belonging to someone else). Only RM/AM/ADMIN/SM may
+               search or look up another person's profile; every other caller
+               may fetch only their own record, and the requested user_id is
+               checked against the authenticated actor id from the JWT, never
+               trusted from the query string alone. */
+            const actor = await ownership.getActor(req.user?._id, next);
+            if (!actor) {
+                return next(forbidden('Not authorized'));
+            }
+            const STAFF_ROLES_FOR_USER_SEARCH = ['RM', 'AM', 'ADMIN', 'SM'];
+            if (!STAFF_ROLES_FOR_USER_SEARCH.includes(actor.user_type)) {
+                const requestedId = req.query.user_id ? Number(req.query.user_id) : null;
+                if (!requestedId || requestedId !== Number(actor.user_id)) {
+                    return next(forbidden('You are not authorized to view this profile'));
+                }
+            }
+
             /* ------------------ Base Query ------------------ */
             let query = "SELECT * FROM users WHERE 1 AND user_type='user' AND is_deleted = 0 AND is_verified=1 AND user_type != 'ADMIN'";
             let cond = '';
