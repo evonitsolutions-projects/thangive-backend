@@ -335,9 +335,15 @@ async function buildTotals(start, end, partnerRows, next) {
 }
 
 /* ---------------- transaction rows (list + export) ---------------- */
-async function fetchPaymentRows(kind, w, limit, next) {
+// includeNotReceived: BUY-only, opt-in. When true, NOT_RECEIVED am_status rows are included
+// (status: 'NOT_RECEIVED' / status_key: 'not_received') instead of being left out as usual.
+// Default false keeps every existing caller's behavior identical.
+async function fetchPaymentRows(kind, w, limit, next, includeNotReceived = false) {
     const isBuy = kind === 'buy';
     const dateExpr = isBuy ? BUY_DATE : SELL_DATE;
+    const payCond = isBuy && includeNotReceived
+        ? `ot.rm_status NOT IN ('CANCEL', 'REJECTED') AND pt.am_status IN ('RECEVIED', 'PENDING', 'NOT_RECEIVED')`
+        : PAY_COND;
     const rows = await getData(
         `SELECT pt.payment_custom_id AS txn_id, ot.order_custom_id, ${NAME('u')} AS client,
                 pt.amount, pt.transaction_ref AS ref, ${FMT(dateExpr)} AS txn_date, pt.am_status,
@@ -350,13 +356,22 @@ async function fetchPaymentRows(kind, w, limit, next) {
             WHERE am_status = 'RECEVIED'
             GROUP BY order_id
          ) am_payment_sum ON am_payment_sum.order_id = ot.order_id
-         WHERE ${PAY_COND} AND ot.transaction_type = '${isBuy ? 'BUY' : 'SELL'}'${rangeCond(dateExpr, w.start, w.end)}
+         WHERE ${payCond} AND ot.transaction_type = '${isBuy ? 'BUY' : 'SELL'}'${rangeCond(dateExpr, w.start, w.end)}
          ORDER BY ${dateExpr} DESC, pt.payment_id DESC${limit ? ` LIMIT ${Number(limit)}` : ''}`,
         next
     );
     return (rows || []).map((r) => {
-        const done = r.am_status === 'RECEVIED';
         const outstanding = (r.deal_value || 0) - (r.amount_paid_am || 0);
+        let status;
+        let status_key;
+        if (isBuy && r.am_status === 'NOT_RECEIVED') {
+            status = 'NOT_RECEIVED';
+            status_key = 'not_received';
+        } else {
+            const done = r.am_status === 'RECEVIED';
+            status = isBuy ? (done ? 'Verified' : 'Pending verification') : (done ? 'Paid' : 'Pending payout');
+            status_key = done ? 'done' : 'pending';
+        }
         return {
             txn_id: r.txn_id || null,
             order_id: r.order_custom_id,
@@ -367,10 +382,23 @@ async function fetchPaymentRows(kind, w, limit, next) {
             mode: null,
             ref: r.ref || null,
             date: r.txn_date,
-            status: isBuy ? (done ? 'Verified' : 'Pending verification') : (done ? 'Paid' : 'Pending payout'),
-            status_key: done ? 'done' : 'pending',
+            status,
+            status_key,
         };
     });
+}
+
+/** Count of NOT_RECEIVED BUY payment rows in range — kept separate from paymentTotals()
+ *  so the summary cards (which call paymentTotals()) are never affected by this. */
+async function notReceivedBuyCount(start, end, next) {
+    const rows = await getData(
+        `SELECT COUNT(*) AS c
+         ${PAY_FROM}
+         WHERE ot.rm_status NOT IN ('CANCEL', 'REJECTED') AND pt.am_status = 'NOT_RECEIVED'
+           AND ot.transaction_type = 'BUY'${rangeCond(BUY_DATE, start, end)}`,
+        next
+    );
+    return num(rows?.[0]?.c);
 }
 
 async function fetchRefundRows(w, limit, next) {
@@ -680,9 +708,10 @@ const accountsDashboardController = {
             let rows = [];
             let total = 0;
             if (wants('buy')) {
-                rows = rows.concat(await fetchPaymentRows('buy', w, need, next));
+                rows = rows.concat(await fetchPaymentRows('buy', w, need, next, true));
                 const t = await paymentTotals('BUY', w.start, w.end, next);
-                total += t.done.count + t.pending.count;
+                const nr = await notReceivedBuyCount(w.start, w.end, next);
+                total += t.done.count + t.pending.count + nr;
             }
             if (wants('sell')) {
                 rows = rows.concat(await fetchPaymentRows('sell', w, need, next));
@@ -739,7 +768,7 @@ const accountsDashboardController = {
 
             const partnerRows = await loadPartnerRows(next);
             let rows = [
-                ...(await fetchPaymentRows('buy', w, EXPORT_ROW_CAP, next)),
+                ...(await fetchPaymentRows('buy', w, EXPORT_ROW_CAP, next, true)),
                 ...(await fetchPaymentRows('sell', w, EXPORT_ROW_CAP, next)),
                 ...(await fetchRefundRows(w, EXPORT_ROW_CAP, next)),
                 ...partnerTxnRows(partnerRows, w),
