@@ -3683,6 +3683,35 @@ const partnerController = {
                 return next(error);
             }
 
+            /* ------------------ TRANSACTION ID VALIDATION (AM's payment_id) ------------------
+               payment_id is always required here (no NOT_RECEIVED-style
+               carve-out exists for commission payments), so the length check
+               always runs. Duplicate check is scoped to partner_commission
+               only -- the same value in payment_transactions.transaction_ref
+               is a separate, independent uniqueness rule (migration 018),
+               by the confirmed decision that the two tables are not linked.
+               This is an insert-only endpoint (an existing per-order 409
+               check already runs below), so no "exclude own row" case. */
+            {
+                const refValue = String(dataObj.payment_id).trim();
+                if (refValue.length < 12) {
+                    return next(CustomErrorHandler.badRequest(
+                        "Transaction ID must be at least 12 characters long."
+                    ));
+                }
+                const dupRows = await getData(
+                    `SELECT commission_id FROM partner_commission
+                      WHERE payment_id = '${refValue.replace(/'/g, "''")}'
+                      LIMIT 1`,
+                    next
+                );
+                if (dupRows && dupRows.length) {
+                    return next(new CustomErrorHandler(409,
+                        "This Transaction ID already exists. Please enter a unique Transaction ID."
+                    ));
+                }
+            }
+
             /* ------------------ ORDER CHECKS ------------------ */
             // The commission invoice number already exists (created with the Share Debit ID).
             // Add Payment must not create it and must not run twice for one order.
@@ -3748,11 +3777,27 @@ const partnerController = {
             INSERT INTO partner_commission SET ?
         `;
 
+            // Duplicate-key backstop for a true race, same reasoning as
+            // transactionController.addUpdatePayment: migration 018's unique
+            // index on payment_id_norm rejects a second simultaneous write
+            // at the database, translated here to the same message the
+            // pre-check above already returns. Any other DB error is
+            // forwarded unchanged, exactly as before this change.
+            let dupKeyHit = false;
             const result = await insertData(
                 insertQuery,
                 commissionData,
-                next
+                (err) => {
+                    if (err && (err.code === 'ER_DUP_ENTRY' || err.errno === 1062)) {
+                        dupKeyHit = true;
+                        return next(new CustomErrorHandler(409,
+                            "This Transaction ID already exists. Please enter a unique Transaction ID."
+                        ));
+                    }
+                    return next(err);
+                }
             );
+            if (dupKeyHit || !result) return;
 
             /* ------------------ UPDATE VERIFY STATUS ------------------ */
             const updateQuery = `

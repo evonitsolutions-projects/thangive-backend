@@ -1770,6 +1770,40 @@ const transactionController = {
             const { error } = paymentSchema.validate(dataObj);
             if (error) return next(error);
 
+            /* ------------------ TRANSACTION ID VALIDATION (AM only) ------------------
+               Only runs when a value was actually submitted -- an empty
+               transaction_ref (the existing NOT_RECEIVED carve-out, Joi
+               already allows '') is left completely untouched, exactly as
+               before. Length check first (cheap), then a duplicate check
+               against every OTHER row in payment_transactions (own row
+               excluded on update). The same value may exist unrelated in
+               partner_commission.payment_id -- that is a separate table and
+               a separate, independent uniqueness rule (migration 018). */
+            if (dataObj.transaction_ref) {
+                const refValue = String(dataObj.transaction_ref).trim();
+                if (refValue.length > 0 && refValue.length < 12) {
+                    return next(CustomErrorHandler.badRequest(
+                        "Transaction ID must be at least 12 characters long."
+                    ));
+                }
+                if (refValue.length > 0) {
+                    const dupCond = dataObj.payment_id
+                        ? ` AND payment_id <> ${Number(dataObj.payment_id)}`
+                        : '';
+                    const dupRows = await getData(
+                        `SELECT payment_id FROM payment_transactions
+                          WHERE transaction_ref = '${refValue.replace(/'/g, "''")}'${dupCond}
+                          LIMIT 1`,
+                        next
+                    );
+                    if (dupRows && dupRows.length) {
+                        return next(new CustomErrorHandler(409,
+                            "This Transaction ID already exists. Please enter a unique Transaction ID."
+                        ));
+                    }
+                }
+            }
+
             /* ------------------ RM OWNERSHIP GUARD (P5) ------------------ */
             // Mirrors the COALESCE(ot.owner_rm_id, <client>.assign_to) pattern already used
             // by every other RM ownership gate in this file (e.g. updateOrderStatus above,
@@ -1974,7 +2008,24 @@ const transactionController = {
                 query = `UPDATE payment_transactions SET ? WHERE payment_id = ${dataObj.payment_id}`;
             }
 
-            const result = await insertData(query, finalObj, next);
+            // Duplicate-key backstop for a true race (two simultaneous submissions
+            // of the same transaction_ref both passing the SELECT-based check
+            // above before either INSERT/UPDATE commits): migration 018's unique
+            // index on transaction_ref_norm rejects the second write at the
+            // database with MySQL error 1062, translated here to the same
+            // user-facing message the pre-check already returns. Any other DB
+            // error is forwarded unchanged, exactly as before this change.
+            let dupKeyHit = false;
+            const result = await insertData(query, finalObj, (err) => {
+                if (err && (err.code === 'ER_DUP_ENTRY' || err.errno === 1062)) {
+                    dupKeyHit = true;
+                    return next(new CustomErrorHandler(409,
+                        "This Transaction ID already exists. Please enter a unique Transaction ID."
+                    ));
+                }
+                return next(err);
+            });
+            if (dupKeyHit || !result) return;
 
             if (isInsert) {
                 finalObj.payment_id = result.insertId;
