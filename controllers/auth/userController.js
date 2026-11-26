@@ -1305,7 +1305,11 @@ const userController = {
                 user_id: Joi.number().integer(),
                 assign_to: Joi.number().integer(),
                 username: Joi.string(),
-                email: Joi.string().email(),
+                // Plain string, not .email() -- matches phone_number's own
+                // validation so a partial, as-you-type address (e.g. "ram@gm")
+                // reaches the existing `email LIKE '%...%'` filter below
+                // instead of being rejected by a strict email-format check.
+                email: Joi.string(),
                 phone_number: Joi.string(),
                 pagination: Joi.boolean(),
                 current_page: Joi.number().integer(),
