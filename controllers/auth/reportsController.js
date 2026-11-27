@@ -133,6 +133,22 @@ const text = (key, label, extra = {}) => ({ key, label, type: 'text', ...extra }
 const count = (key, label, extra = {}) => ({ key, label, type: 'number', ...extra });
 const status = (key, label, extra = {}) => ({ key, label, type: 'status', ...extra });
 const when = (key, label, extra = {}) => ({ key, label, type: 'date', ...extra });
+const link = (key, label, extra = {}) => ({ key, label, type: 'link', ...extra });
+
+/* latest payment row per order (RM's own add) and latest AM-written payment row per order --
+ * the same two joins getStockOrderList uses for "RM Payment Status" and "AM Payment Status". */
+const LATEST_PAYMENT_JOINS = `
+    LEFT JOIN (
+        SELECT pt1.* FROM payment_transactions pt1
+        INNER JOIN (SELECT order_id, MAX(payment_id) AS latest_payment_id FROM payment_transactions GROUP BY order_id) pt2
+            ON pt2.order_id = pt1.order_id AND pt2.latest_payment_id = pt1.payment_id
+    ) latest_payment ON latest_payment.order_id = ot.order_id
+    LEFT JOIN (
+        SELECT pa1.order_id, pa1.am_status FROM payment_transactions pa1
+        INNER JOIN (
+            SELECT order_id, MAX(payment_id) AS latest_am_payment_id FROM payment_transactions WHERE am_Datetime IS NOT NULL GROUP BY order_id
+        ) pa2 ON pa2.order_id = pa1.order_id AND pa2.latest_am_payment_id = pa1.payment_id
+    ) latest_am_payment ON latest_am_payment.order_id = ot.order_id`;
 
 const DEFS = {};
 
@@ -146,11 +162,16 @@ DEFS.orders = {
         'Completed orders show the full order value; running orders show partial amounts as they progress.',
     ],
     columns: [
-        text('order_custom_id', 'Order ID'), when('order_date', 'Order date'), text('client_name', 'Client'),
-        text('rm_name', 'RM', { pdf: false }), text('partner_name', 'Partner', { pdf: false }), text('company_name', 'Company'),
-        status('transaction_type', 'Type'), count('quantity', 'Qty'), money('price', 'Price'), money('order_value', 'Order value'),
-        status('rm_status', 'RM', { pdf: false }), status('am_status', 'AM', { pdf: false }), status('st_status', 'ST', { pdf: false }),
-        status('refund_status', 'Refund', { pdf: false }), status('order_status', 'Status'),
+        text('order_custom_id', 'Order ID'), text('partner_custom_id', 'Partner Id'), text('partner_name', 'Partner Name'),
+        text('customer_custom_id', 'Customer ID'), text('payment_custom_id', 'Payment ID'), text('share_debit_invoice', 'Invoice No'),
+        when('order_date', 'Order Date-Time'), when('rm_datetime', 'RM Date-Time'), when('am_datetime', 'AM Date-Time'),
+        when('st_datetime', 'ST Date-Time'), text('rm_name', 'RM Name'), text('client_name', 'Customer Name'),
+        text('client_phone', 'Contact No'), text('advisor_name', 'Advisor'), text('company_name', 'Stock Name'),
+        text('order_type', 'Order Type'), status('transaction_type', 'Transaction Type'), money('price', 'RM Price'),
+        count('quantity', 'RM Quantity'), money('order_value', 'Deal Value'), status('rm_status', 'RM Status'),
+        status('payment_type', 'RM Payment Status'), status('am_payment_status', 'AM Payment Status'),
+        status('am_status', 'AM Status'), status('st_status', 'ST Status'), status('refund_status', 'Refund Status'),
+        status('cancellation_status', 'Cancellation Status'), link('order_transaction_id', 'Stock Details', { pdf: false }),
     ],
     joi: {
         transaction_type: en('BUY', 'SELL'), order_status: en('running', 'completed', 'closed'),
@@ -161,12 +182,21 @@ DEFS.orders = {
     },
     from: `FROM order_transactions ot ${ORDER_JOINS}
     LEFT JOIN advisor ad ON ad.advisor_id = ot.advisor_id
-    LEFT JOIN broker br ON br.broker_id = ot.broker_id`,
-    select: `ot.order_custom_id AS order_custom_id, ${FMT(CREATED_IST)} AS order_date, ${NAME('u')} AS client_name,
-        ${NAME('rm')} AS rm_name, ${NAME('p')} AS partner_name, sd.company_name AS company_name,
-        ot.transaction_type AS transaction_type, ot.quantity AS quantity, ot.price_per_share AS price, ${VALUE} AS order_value,
-        ot.rm_status AS rm_status, ot.am_status AS am_status, ot.st_status AS st_status, ot.refund_status AS refund_status,
-        CASE WHEN ${CLOSED} THEN 'Cancelled' WHEN ${ALL_DONE} THEN 'Completed' ELSE 'Running' END AS order_status`,
+    LEFT JOIN broker br ON br.broker_id = ot.broker_id
+    ${LATEST_PAYMENT_JOINS}`,
+    select: `ot.order_custom_id AS order_custom_id, p.user_custum_id AS partner_custom_id, ${NAME('p')} AS partner_name,
+        u.user_custum_id AS customer_custom_id, latest_payment.payment_custom_id AS payment_custom_id,
+        ot.share_Debit_Invoice AS share_debit_invoice, ${FMT(CREATED_IST)} AS order_date,
+        ${FMT('ot.rm_datetime')} AS rm_datetime, ${FMT('ot.am_datetime')} AS am_datetime, ${FMT('ot.st_datetime')} AS st_datetime,
+        ${NAME('rm')} AS rm_name, ${NAME('u')} AS client_name, u.phone_number AS client_phone, ad.advisor_name AS advisor_name,
+        sd.company_name AS company_name, ot.order_type AS order_type, ot.transaction_type AS transaction_type,
+        ot.price_per_share AS price, ot.quantity AS quantity, ${VALUE} AS order_value, ot.rm_status AS rm_status,
+        CASE WHEN latest_payment.payment_type = 'FULL' THEN 'FULL PAYMENT'
+             WHEN latest_payment.payment_type = 'PARTIAL' THEN 'PARTIAL PAYMENT'
+             ELSE latest_payment.payment_type END AS payment_type,
+        CASE WHEN ot.transaction_type = 'BUY' THEN latest_am_payment.am_status ELSE NULL END AS am_payment_status,
+        ot.am_status AS am_status, ot.st_status AS st_status, ot.refund_status AS refund_status,
+        ot.cancellation_status AS cancellation_status, ot.order_id AS order_transaction_id`,
     dateExpr: CREATED_IST,
     scope: scopeOwner,
     search: ['ot.order_custom_id', NAME('u'), 'u.username', 'sd.company_name', NAME('p')],
@@ -581,14 +611,16 @@ DEFS.performance = {
     title: 'Employee Performance Reports',
     columns: [
         text('employee_id', 'Employee ID'), text('employee_name', 'Employee'), status('role', 'Role'), count('assigned_clients', 'Assigned clients'),
-        count('orders', 'Orders'), money('order_value', 'Order value'), count('completed_orders', 'Completed'), count('partner_orders', 'Partner orders'),
+        count('orders', 'Orders'), money('order_value', 'Order value'), count('completed_orders', 'Completed'),
+        money('completed_order_value', 'Completed Order Value'), count('partner_orders', 'Partner orders'),
         count('refunds_raised', 'Refunds raised'), count('refunds_reviewed', 'Refunds reviewed'), count('refunds_processed', 'Refunds processed'),
         money('refund_amount_processed', 'Refund amount processed'), count('payments_actioned', 'Payments with recorded actor'),
     ],
     joi: { rm_id: idNum() },
     summary: [
         count('employees', 'Employees'), count('orders', 'Orders (RM owned)'), money('order_value', 'Order value (RM owned)'),
-        count('completed_orders', 'Completed orders'), count('refunds_reviewed', 'Refunds reviewed'), count('refunds_processed', 'Refunds processed'),
+        count('completed_orders', 'Completed orders'), money('completed_order_value', 'Completed order value'),
+        count('refunds_reviewed', 'Refunds reviewed'), count('refunds_processed', 'Refunds processed'),
     ],
     notes: [
         'Shows activity by employees: RMs by their assigned clients and orders handled, AMs by refunds reviewed and processed, ST by share transfers completed.',
@@ -875,6 +907,7 @@ async function runPerformance(def, f, actor, all, next) {
             IF(e.user_type = 'RM', ${ownedOrders('COUNT(*)')}, NULL) AS orders,
             IF(e.user_type = 'RM', ${ownedOrders(`IFNULL(SUM(${VALUE}), 0)`)}, NULL) AS order_value,
             IF(e.user_type = 'RM', ${ownedOrders('COUNT(*)', ` AND ${ALL_DONE}`)}, NULL) AS completed_orders,
+            IF(e.user_type = 'RM', ${ownedOrders(`IFNULL(SUM(${VALUE}), 0)`, ` AND ${ALL_DONE}`)}, NULL) AS completed_order_value,
             IF(e.user_type = 'RM', ${ownedOrders('COUNT(*)', ' AND ot.addedPartnerID IS NOT NULL')}, NULL) AS partner_orders,
             IF(e.user_type = 'RM', (SELECT COUNT(*) FROM refund_requests rr WHERE rr.requested_by = e.user_id${rc('rr.requested_datetime')}), NULL) AS refunds_raised,
             IF(e.user_type = 'AM', (SELECT COUNT(*) FROM refund_requests rr WHERE rr.reviewed_by = e.user_id${rc('rr.reviewed_datetime')}), NULL) AS refunds_reviewed,
@@ -889,7 +922,7 @@ async function runPerformance(def, f, actor, all, next) {
 
     const list = (rows || []).map((r) => {
         const o = { ...r };
-        ['assigned_clients', 'orders', 'order_value', 'completed_orders', 'partner_orders', 'refunds_raised', 'refunds_reviewed',
+        ['assigned_clients', 'orders', 'order_value', 'completed_orders', 'completed_order_value', 'partner_orders', 'refunds_raised', 'refunds_reviewed',
             'refunds_processed', 'refund_amount_processed', 'payments_actioned'].forEach((k) => {
             o[k] = r[k] === null || r[k] === undefined ? null : round2(num(r[k]));
         });
@@ -898,6 +931,7 @@ async function runPerformance(def, f, actor, all, next) {
     const sumOf = (k) => round2(list.reduce((s, r) => s + num(r[k]), 0));
     const totals = {
         employees: list.length, orders: sumOf('orders'), order_value: sumOf('order_value'), completed_orders: sumOf('completed_orders'),
+        completed_order_value: sumOf('completed_order_value'),
         refunds_reviewed: sumOf('refunds_reviewed'), refunds_processed: sumOf('refunds_processed'),
     };
     return {

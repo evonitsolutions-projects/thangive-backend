@@ -445,6 +445,21 @@ const transactionController = {
                         "Payment is already received for this order. It cannot be cancelled or rejected directly. The RM must raise a refund request to AM."
                     ));
                 }
+
+                /* ------------------ BUY SHARE TRANSFER: screenshot + Pending guard ------------------ */
+                // ST, BUY orders only: a Share Debit screenshot can only be submitted once the Share
+                // Transfer Status is Completed, never while it is still Pending. Mirrors the frontend
+                // check in shareTransperModal.jsx, enforced here too so a direct API call cannot bypass it.
+                if (
+                    dataObj.employee_type === 'ST' &&
+                    refundCtx.order.transaction_type === 'BUY' &&
+                    dataObj.status === 'PENDING' &&
+                    req.files?.share_Debit?.length > 0
+                ) {
+                    return next(CustomErrorHandler.badRequest(
+                        "Please change the Share Transfer Status to Completed before submitting the screenshot."
+                    ));
+                }
             }
 
             /* ------------------ UPDATE ORDER ------------------ */
@@ -2417,6 +2432,9 @@ const transactionController = {
 
                 company_name: Joi.string().optional(),
                 am_status: Joi.string().valid("PENDING", "RECEVIED", "NOT_RECEIVED").optional(),
+                // AM Order Status (Buy Order Transactions only): filters on the order's own am_status stage,
+                // separate from pt.am_status above.
+                order_am_status: Joi.string().valid("PENDING", "COMPLETED").optional(),
                 payment_type: Joi.string().valid("FULL", "PARTIAL").optional(),
                 from_date: Joi.string().optional(),
                 to_date: Joi.string().optional(),
@@ -2572,8 +2590,19 @@ const transactionController = {
                 cond += ` AND COALESCE(ot.owner_rm_id, u.assign_to) = ${value.employee_id}`;
             }
 
-            if (value.am_status) {
+            if (value.am_status === 'PENDING' && value.transaction_type === 'BUY') {
+                // Buy Order Transactions only: Pending now also covers payments already
+                // RECEVIED where the order's own AM stage is still PENDING. SELL, and every
+                // other Transaction Status value (Received, Not Received, All), are unchanged.
+                cond += ` AND (pt.am_status = 'PENDING' OR (pt.am_status = 'RECEVIED' AND ot.am_status = 'PENDING'))`;
+            } else if (value.am_status) {
                 cond += ` AND pt.am_status = '${value.am_status}'`;
+            }
+
+            if (value.order_am_status && value.transaction_type === 'BUY') {
+                // New AM Order Status filter (Buy Order Transactions only): filters on the
+                // order's own am_status, independent of the Transaction Status filter above.
+                cond += ` AND ot.am_status = '${value.order_am_status}'`;
             }
 
             if (value.payment_type) {

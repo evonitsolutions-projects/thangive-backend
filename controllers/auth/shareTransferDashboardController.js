@@ -42,6 +42,7 @@ const MONTH_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Se
 
 /* ---------------- helpers ---------------- */
 const num = (v) => Number(v || 0);
+const round2 = (v) => Math.round((Number(v) + Number.EPSILON) * 100) / 100;
 const pad = (n) => String(n).padStart(2, '0');
 const monthStr = (y, m0) => `${y}-${pad(m0 + 1)}-01 00:00:00`;
 const IST = (col) => `CONVERT_TZ(${col}, '+00:00', '+05:30')`;
@@ -102,7 +103,7 @@ const periodSchema = Joi.object({ period: Joi.string().valid('month', 'year', 'a
 
 /* ---------------- shared SQL: one row per order with its direction, state and entry date ---------------- */
 const RAW = `
-    SELECT ot.order_id, ot.order_custom_id, ot.transaction_type AS t, ot.quantity AS qty, ot.advisor_id,
+    SELECT ot.order_id, ot.order_custom_id, ot.transaction_type AS t, ot.quantity AS qty, ot.price_per_share AS price, ot.advisor_id,
            ot.rm_status, ot.am_status, ot.st_status, ot.refund_status, ot.cancellation_status,
            IFNULL(ot.markAsSold, 0) AS mas,
            IFNULL(ot.am_datetime, ${IST('ot.created_at')}) AS buy_dt,
@@ -139,22 +140,29 @@ const LEVEL = `
 /** BUY / SELL totals (DONE + PENDING only) and the refund figures for one window. */
 async function summaryFor(start, end, next) {
     const rows = await getData(
-        `SELECT x.dir, x.state, COUNT(*) AS c, IFNULL(SUM(x.qty), 0) AS q
+        `SELECT x.dir, x.state, COUNT(*) AS c, IFNULL(SUM(x.qty), 0) AS q, IFNULL(SUM(x.qty * x.price), 0) AS v
          FROM (${LEVEL}) x
          WHERE x.dir IN ('BUY', 'SELL') AND x.state IN ('DONE', 'PENDING')${rangeCond('x.ref_dt', start, end)}
          GROUP BY x.dir, x.state`,
         next
     );
-    const side = () => ({ done: { count: 0, shares: 0 }, pending: { count: 0, shares: 0 } });
+    const side = () => ({ done: { count: 0, shares: 0, value: 0 }, pending: { count: 0, shares: 0 } });
     const out = { BUY: side(), SELL: side() };
     (rows || []).forEach((r) => {
         const slot = r.state === 'DONE' ? out[r.dir].done : out[r.dir].pending;
         slot.count = num(r.c);
         slot.shares = num(r.q);
+        // Value is only ever computed for DONE rows (see shape() below) -- pending,
+        // rejected and cancelled orders never contribute to it.
+        if (r.state === 'DONE') slot.value = round2(num(r.v));
     });
     const shape = (s) => ({
         total: s.done.count + s.pending.count,
         shares: s.done.shares + s.pending.shares,
+        // Total value of successfully completed (DONE) orders only -- pending, rejected
+        // and cancelled orders are excluded, unlike `total`/`shares` above which combine
+        // done + pending.
+        value: s.done.value,
         done: s.done,
         pending: s.pending,
     });
